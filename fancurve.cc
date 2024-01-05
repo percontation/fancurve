@@ -79,7 +79,7 @@ typedef struct {
   uint8_t        bytes[32];
 } SMCParamStruct;
 
-}
+} // extern "C"
 
 namespace {
 
@@ -324,6 +324,7 @@ public:
 };
 #endif
 
+/// General class for interacting with SMC keys.
 class SMC {
 public:
   struct Key {
@@ -552,10 +553,11 @@ public:
   }
 };
 
+
 namespace {
 
 // We use this function as a proxy for being allowed to run the chassis temperatures
-// hotter on account of not being in contact with a person.
+// hotter, based on the assumption that a docked laptop will not be on a person's lap.
 bool is_docked() {
   uint32_t count = 0;
   return CGGetOnlineDisplayList(0, nullptr, &count) == kCGErrorSuccess && count > 1;
@@ -608,6 +610,7 @@ int main(int argc, char *argv[]) {
   bool tty = isatty(fileno(stderr));
   bool templog = tty; // Write out the temps to the terminal.
   bool raise_floor = false; // Keep fans at least 68% high.
+  bool dry = false; // No SMC writes. Won't require root.
 
   for(int i = 1; i < argc; i++) {
     if(std::strcmp(argv[i], "log") == 0)
@@ -616,6 +619,8 @@ int main(int argc, char *argv[]) {
       templog = false;
     if(std::strcmp(argv[i], "high") == 0)
       raise_floor = true;
+    if(std::strcmp(argv[i], "dry") == 0)
+      dry = true;
   }
 
   std::vector<SMC::Key> hot;
@@ -624,6 +629,9 @@ int main(int argc, char *argv[]) {
   std::vector<SMC::Key> other;
   std::vector<fan_info> fans;
 
+  //
+  // Discover the SMC keys for temps and fans.
+  //
   int keys = smc.read_int('#KEY');
   for(int i = 0; i < keys; ++i) {
     SMC::Key key = smc.get_key_from_index(i);
@@ -674,25 +682,30 @@ int main(int argc, char *argv[]) {
       fan.max = smc.read_num(SMC::Key(t));
       t[3] = 'n';
       fan.min = smc.read_num(SMC::Key(t));
-      
-      bool success = false;
-      if(fan.max > fan.min) { // sneaky: check that neither is NaN
-        t[3] = 'd';
-        if(smc.write_int(SMC::Key(t), 1)) {
-          t[2] = 'T';
-          t[3] = 'g';
-          if(smc.write_num(SMC::Key(t), fan.max)) {
-            success = true;
+
+      if(dry) {
+        if(fan.max > fan.min)
+          fans.push_back(fan);
+      } else {
+        bool success = false;
+        if(fan.max > fan.min) { // sneaky: check that neither is NaN
+          t[3] = 'd';
+          if(smc.write_int(SMC::Key(t), 1)) {
+            t[2] = 'T';
+            t[3] = 'g';
+            if(smc.write_num(SMC::Key(t), fan.max)) {
+              success = true;
+            }
           }
         }
-      }
-      if(success) {
-        fans.push_back(fan);
-      } else {
-        // Return to automatic control.
-        t[2] = 'M';
-        t[3] = 'd';
-        smc.write_int(SMC::Key(t), 0);
+        if(success) {
+          fans.push_back(fan);
+        } else {
+          // Return to automatic control.
+          t[2] = 'M';
+          t[3] = 'd';
+          smc.write_int(SMC::Key(t), 0);
+        }
       }
     }
   }
@@ -751,7 +764,7 @@ int main(int argc, char *argv[]) {
       if(templog && tty)
         fprintf(stderr, "\033[10A");
       // Need to periodically re-enable manual mode.
-      for(fan_info &fan : fans)
+      if(!dry) for(fan_info &fan : fans)
         smc.write_int(fan.Md(), 1);
     }
     // Print the target fan percentage value and the "hottest" sensor responsible for it.
@@ -769,7 +782,7 @@ int main(int argc, char *argv[]) {
 
     if(raise_floor && percent < 68)
       percent = 68;
-    for(fan_info &fan : fans)
+    if(!dry) for(fan_info &fan : fans)
       smc.write_num(fan.Tg(), percent/99.f * (fan.max - fan.min) + fan.min);
 
     // Sleep 2-7 seconds; updates come slower when temps are cool.
@@ -777,7 +790,7 @@ int main(int argc, char *argv[]) {
     usleep(2'000'000 + int(5'000'000 * (1. - sorted[2]/99.)));
   }
 
-  for(fan_info &fan : fans)
+  if(!dry) for(fan_info &fan : fans)
     smc.write_int(fan.Md(), 0);
 
   return 0;
